@@ -78,6 +78,24 @@ def run_yolo_analysis(frame):
     except Exception as e:
         return None, f"Error in detection pipeline: {str(e)}", "", ""
 
+def process_live_frame(frame):
+    """Process frame for live detection display (no OpenAI analysis)"""
+    if frame is None:
+        return frame
+    
+    try:
+        # Run detection and draw boxes
+        boxed_frame, detections = detector.detect_and_draw(frame)
+        
+        # Convert BGR to RGB for Gradio display
+        frame_rgb = cv2.cvtColor(boxed_frame, cv2.COLOR_BGR2RGB)
+        
+        return frame_rgb
+        
+    except Exception as e:
+        print(f"Error in live frame processing: {e}")
+        return frame if frame is not None else np.zeros((480, 640, 3), dtype=np.uint8)
+
 def capture_frame_threaded():
     """Capture frame using threading - will fail on macOS Docker but kept for compatibility"""
     frame_queue = queue.Queue()
@@ -127,33 +145,146 @@ def capture_frame_threaded():
     else:
         return None, "Camera not accessible (expected in Docker on macOS)"
 
-def capture_and_analyze():
-    """Capture photo with camera and analyze it"""
-    frame, message = capture_frame_threaded()
+# Global variables for camera management
+camera_cap = None
+camera_thread = None
+camera_running = False
+latest_frame = None
+frame_lock = threading.Lock()
+camera_initialized = False
+
+def initialize_camera():
+    """Initialize camera in a separate thread"""
+    global camera_cap, camera_running, latest_frame
     
-    if frame is not None:
-        # Convert BGR to RGB for display
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    try:
+        # Try different backends
+        for backend in [cv2.CAP_AVFOUNDATION, cv2.CAP_DSHOW, cv2.CAP_V4L2, cv2.CAP_ANY]:
+            camera_cap = cv2.VideoCapture(0, backend)
+            if camera_cap.isOpened():
+                # Configure camera
+                camera_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                camera_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                camera_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                print(f"Camera initialized with backend: {backend}")
+                return True
+                
+        print("Failed to initialize camera")
+        return False
         
-        # Run YOLO analysis
-        output_image_path, thought, emotion, action = run_yolo_analysis(frame)
+    except Exception as e:
+        print(f"Camera initialization error: {e}")
+        return False
+
+def camera_loop():
+    """Continuous camera capture loop"""
+    global camera_cap, camera_running, latest_frame
+    
+    while camera_running and camera_cap and camera_cap.isOpened():
+        try:
+            ret, frame = camera_cap.read()
+            if ret and frame is not None:
+                # Process frame with YOLO detection
+                processed_frame = process_live_frame(frame)
+                
+                with frame_lock:
+                    latest_frame = processed_frame
+            else:
+                time.sleep(0.01)  # Short sleep if read fails
+                
+        except Exception as e:
+            print(f"Error in camera loop: {e}")
+            time.sleep(0.1)
         
-        if output_image_path and os.path.exists(output_image_path):
-            # Load the analyzed image for display
-            analyzed_image = cv2.imread(output_image_path)
-            analyzed_image_rgb = cv2.cvtColor(analyzed_image, cv2.COLOR_BGR2RGB)
-            
-            # Format the results
-            results_text = f"**Thought:** {thought}\n\n**Emotion:** {emotion}\n\n**Action:** {action}"
-            
-            return analyzed_image_rgb, results_text
+        time.sleep(0.05)  # ~20 FPS
+
+def start_camera():
+    """Start the camera feed"""
+    global camera_thread, camera_running, camera_initialized
+    
+    if not camera_running:
+        if initialize_camera():
+            camera_running = True
+            camera_initialized = True
+            camera_thread = threading.Thread(target=camera_loop, daemon=True)
+            camera_thread.start()
+            return True
         else:
-            return frame_rgb, f"Analysis failed: {thought}"
+            camera_initialized = False
+            return False
+    camera_initialized = True
+    return True
+
+def stop_camera():
+    """Stop the camera feed"""
+    global camera_cap, camera_thread, camera_running, latest_frame
+    
+    camera_running = False
+    
+    if camera_thread:
+        camera_thread.join(timeout=1)
+    
+    if camera_cap:
+        camera_cap.release()
+        camera_cap = None
+    
+    with frame_lock:
+        latest_frame = None
+    
+    return "Camera stopped"
+
+def get_latest_frame():
+    """Get the latest processed frame"""
+    global latest_frame, camera_initialized
+    
+    with frame_lock:
+        if latest_frame is not None and camera_initialized:
+            return latest_frame.copy()
+        else:
+            # Return None when camera not initialized (this will hide the image component)
+            return None
+
+def start_camera_ui():
+    """Start camera and update UI visibility"""
+    success = start_camera()
+    if success:
+        # Return updates to hide button and show feed
+        return gr.update(visible=False), gr.update(visible=True)
     else:
-        # Return a message image instead of blank
-        msg_image = np.full((300, 600, 3), 128, dtype=np.uint8)  # Gray background
-        error_msg = f"Camera Error: {message}\n\nℹ️ On macOS with Docker, use the Browser Camera or Upload Image instead!"
-        return msg_image, error_msg
+        # Keep button visible if camera failed to start
+        return gr.update(visible=True), gr.update(visible=False)
+
+def capture_current_frame():
+    """Capture current frame from the live camera and analyze it"""
+    global latest_frame
+    
+    with frame_lock:
+        if latest_frame is not None:
+            # Convert RGB back to BGR for analysis
+            frame_bgr = cv2.cvtColor(latest_frame, cv2.COLOR_RGB2BGR)
+            
+            # Run YOLO analysis with OpenAI
+            output_image_path, thought, emotion, action = run_yolo_analysis(frame_bgr)
+            
+            if output_image_path and os.path.exists(output_image_path):
+                # Load the analyzed image for display
+                analyzed_image = cv2.imread(output_image_path)
+                analyzed_image_rgb = cv2.cvtColor(analyzed_image, cv2.COLOR_BGR2RGB)
+                
+                # Format the results
+                results_text = f"**Thought:** {thought}\n\n**Emotion:** {emotion}\n\n**Action:** {action}"
+                
+                return analyzed_image_rgb, results_text
+            else:
+                return latest_frame, f"Analysis failed: {thought}"
+        else:
+            # Return a message image
+            msg_image = np.full((480, 640, 3), 128, dtype=np.uint8)
+            cv2.putText(msg_image, "No camera frame available", (150, 240), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            cv2.putText(msg_image, "Start camera first", (200, 280), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            return msg_image, "No camera frame available. Please start the camera."
 
 def analyze_uploaded_image(uploaded_file):
     """Analyze uploaded image file"""
@@ -280,8 +411,52 @@ with gr.Blocks(title="CatGPT", theme=gr.themes.Soft()) as app:
         outputs=[role_status]
     )
 
-    with gr.Tab("📷 Camera"):
-        gr.Markdown("## Camera")
+    with gr.Tab("📹 Live Camera Feed"):
+        gr.Markdown("## Live Camera with YOLO Detection")
+        gr.Markdown("*Live camera feed showing real-time object detection*")
+        
+        # Camera initialization button (visible initially)
+        start_camera_btn = gr.Button("🎥 Start Camera Feed", variant="primary", size="lg", visible=True)
+        
+        # Live camera display (hidden initially)
+        live_feed = gr.Image(label="Live Camera Feed", visible=False)
+        
+        # Auto-refresh the live feed (only when visible)
+        def refresh_feed():
+            if camera_initialized and camera_running:
+                return get_latest_frame()
+            return None
+        
+        # Set up periodic refresh
+        refresh_timer = gr.Timer(0.1)  # 10 FPS refresh rate
+        refresh_timer.tick(
+            fn=refresh_feed,
+            outputs=[live_feed]
+        )
+        
+        # Start camera button click event
+        start_camera_btn.click(
+            fn=start_camera_ui,
+            outputs=[start_camera_btn, live_feed]
+        )
+        
+        # Capture and analyze button
+        capture_btn = gr.Button("📸 Capture & Analyze Current Frame", variant="secondary", size="lg")
+        
+        # Results
+        with gr.Row():
+            live_output_image = gr.Image(label="Captured Analysis", type="numpy")
+            live_results = gr.Markdown(label="AI Analysis")
+        
+        # Capture button
+        capture_btn.click(
+            fn=capture_current_frame,
+            inputs=[],
+            outputs=[live_output_image, live_results]
+        )
+
+    with gr.Tab("📷 Browser Camera"):
+        gr.Markdown("## Browser Camera")
         
         # Camera input at the top
         webcam_input = gr.Image(sources=["webcam"], type="pil", label="Capture Photo")

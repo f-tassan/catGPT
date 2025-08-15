@@ -4,15 +4,14 @@ FROM python:3.13-slim
 WORKDIR /app
 
 # Install system dependencies
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
-    libxrender-dev \
+    libxrender1 \
     libgomp1 \
-    libglib2.0-0 \
     libgtk-3-0 \
-    libgl1-mesa-glx \
+    libgl1 \
     libgstreamer1.0-0 \
     libgstreamer-plugins-base1.0-0 \
     v4l-utils \
